@@ -3,21 +3,25 @@ live_predict.py
 
 Full end-to-end demo: opens the camera, detects hand landmarks, runs them
 through the trained classifier, shows the predicted sign + confidence on
-screen, and speaks the predicted letter aloud (with debouncing so it
-doesn't repeat every frame).
+screen, speaks the predicted letter aloud, and builds up a full word by
+accumulating stable letter detections. A space is automatically inserted
+into the word whenever the hand leaves the frame for a sustained period.
 
 Requires: model/sign_language_model.pkl and model/labels.json
           (created by train_model.py)
 
 Controls:
     q -> quit
+    c -> clear the current word
 
-Speaking behavior:
-    - A prediction is only spoken once it has been stable (same letter,
-      confidence above threshold) for STABLE_FRAMES_REQUIRED consecutive
-      frames, and only if it's different from the last spoken letter.
-    - This avoids the model repeating the same letter nonstop while you
-      hold a sign in front of the camera.
+Word-building behavior:
+    - A letter is only added to the word once it has been stable (same
+      letter, confidence above threshold) for STABLE_FRAMES_REQUIRED
+      consecutive frames, and only once per "hold" (won't repeat the same
+      letter over and over while you keep your hand still).
+    - A space is added once the hand has been missing from the frame for
+      NO_HAND_FRAMES_FOR_SPACE consecutive frames (and only once per
+      "hand away" period, so it won't add multiple spaces).
 """
 
 import json
@@ -28,8 +32,10 @@ import numpy as np
 import pyttsx3
 from hand_detector import HandDetector
 
-CONFIDENCE_THRESHOLD = 60.0   # % - below this, prediction is ignored
-STABLE_FRAMES_REQUIRED = 10   # consecutive matching frames before speaking
+CONFIDENCE_THRESHOLD = 60.0       # % - below this, prediction is ignored
+STABLE_FRAMES_REQUIRED = 10       # consecutive matching frames before accepting a letter
+REPEAT_FRAMES_REQUIRED = 45      # extra consecutive frames needed to repeat the same letter
+NO_HAND_FRAMES_FOR_SPACE = 20     # consecutive no-hand frames before inserting a space
 
 
 def load_model(model_path="model/sign_language_model.pkl", labels_path="model/labels.json"):
@@ -59,13 +65,7 @@ def main():
     detector = HandDetector()
 
     def speak(text):
-        """
-        Runs TTS in a background thread so the camera feed doesn't freeze
-        while speaking. Re-initializes the engine each call as a workaround
-        for a known pyttsx3 issue on Windows where reusing one engine
-        instance across multiple say()/runAndWait() calls silently fails
-        after the first call.
-        """
+        """Runs TTS in a background thread so the camera feed doesn't freeze."""
         def _speak():
             engine = pyttsx3.init()
             engine.setProperty('rate', 150)
@@ -75,11 +75,18 @@ def main():
 
         threading.Thread(target=_speak, daemon=True).start()
 
-    last_spoken = None
-    stable_prediction = None
-    stable_count = 0
+    # --- State for letter debouncing ---
+    stable_prediction = None      # letter currently being "held"
+    stable_count = 0              # how many consecutive frames it's been stable
+    next_add_threshold = STABLE_FRAMES_REQUIRED  # stable_count value at which to add a letter
 
-    print("Model loaded. Press 'q' to quit.")
+    # --- State for space insertion ---
+    no_hand_count = 0
+    space_pending = False         # True once hand is gone; prevents multiple spaces
+
+    current_word = ""
+
+    print("Model loaded. Press 'q' to quit, 'c' to clear the word.")
 
     try:
         while True:
@@ -93,6 +100,10 @@ def main():
             landmarks = detector.extract_landmarks(results)
 
             if landmarks is not None:
+                # Hand is visible - reset the "no hand" space tracking
+                no_hand_count = 0
+                space_pending = False
+
                 prediction = model.predict([landmarks])[0]
                 probabilities = model.predict_proba([landmarks])[0]
                 confidence = np.max(probabilities) * 100
@@ -102,17 +113,19 @@ def main():
                 cv2.putText(frame, f"Confidence: {confidence:.1f}%", (10, 80),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
 
-                # --- Debounce + speak logic ---
+                #  Debounce + add letter to word 
                 if confidence >= CONFIDENCE_THRESHOLD:
                     if prediction == stable_prediction:
                         stable_count += 1
                     else:
                         stable_prediction = prediction
                         stable_count = 1
+                        next_add_threshold = STABLE_FRAMES_REQUIRED
 
-                    if stable_count == STABLE_FRAMES_REQUIRED and prediction != last_spoken:
+                    if stable_count == next_add_threshold:
+                        current_word += prediction
                         speak(prediction)
-                        last_spoken = prediction
+                        next_add_threshold = stable_count + REPEAT_FRAMES_REQUIRED
                 else:
                     stable_prediction = None
                     stable_count = 0
@@ -121,12 +134,35 @@ def main():
                             cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
                 stable_prediction = None
                 stable_count = 0
-                last_spoken = None  # allow re-speaking same letter after hand leaves and returns
+
+                # --- Space insertion logic ---
+                no_hand_count += 1
+                if (no_hand_count == NO_HAND_FRAMES_FOR_SPACE
+                        and not space_pending
+                        and current_word
+                        and not current_word.endswith(" ")):
+                    current_word += " "
+                    space_pending = True
+
+            # --- Display the word being built 
+            cv2.rectangle(frame, (0, frame.shape[0] - 60), (frame.shape[1], frame.shape[0]),
+                          (50, 50, 50), -1)
+            cv2.putText(frame, f"Word: {current_word}", (10, frame.shape[0] - 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
+            cv2.putText(frame, "q:quit  c:clear  b:backspace", (10, frame.shape[0] - 45),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
 
             cv2.imshow("Live Sign Prediction", frame)
 
-            if cv2.waitKey(1) & 0xFF == ord('q'):
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
                 break
+            elif key == ord('c'):
+                current_word = ""
+                stable_prediction = None
+                stable_count = 0
+            elif key == ord('b'):
+                current_word = current_word[:-1]
     finally:
         cap.release()
         cv2.destroyAllWindows()
